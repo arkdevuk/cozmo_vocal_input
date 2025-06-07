@@ -13,6 +13,8 @@ from Logger import Logger
 from MQTTClient import mqtt_client
 
 import whisper
+import soundfile as sf
+from tempfile import NamedTemporaryFile
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 whisper_model = whisper.load_model("base", device=device)
@@ -33,30 +35,79 @@ HOST = "0.0.0.0"
 PORT = 8797
 PATH = "/audio"
 
+listening = False  # Global flag
+
 async def handle_connection(websocket):
-    print("[AudioServer] Client connected.")
+    global listening
     print("[AudioServer] Client connected.")
     buffer = b""
+    whisper_audio = bytearray()
+    silence_threshold = 500  # Amplitude below which we consider silence
+    silence_duration = 1.5  # Seconds of silence before auto-stop
+    max_listen_duration = 10  # Maximum allowed listening time in seconds
+
+    silence_start_time = None
+    listening_start_time = None
 
     try:
         async for message in websocket:
             buffer += message
             frame_size = porcupine.frame_length if porcupine else 512
-            frame_bytes = frame_size * 2  # 2 bytes per sample (16-bit PCM)
+            frame_bytes = frame_size * 2  # 2 bytes/sample
 
             while len(buffer) >= frame_bytes:
                 frame = buffer[:frame_bytes]
                 buffer = buffer[frame_bytes:]
                 pcm = np.frombuffer(frame, dtype=np.int16)
-                # we always check for the wake word if not listening
+
+                # Wake word detection
                 if porcupine and porcupine.process(pcm) >= 0:
-                    mqtt_client.publish(f"cozmo/audio_input/wake_word", {
+                    Logger.info("[AudioServer] Wake word detected.")
+                    json_as_string = json.dumps({
                         "event": "wake_word_detected",
                         "stamp": time.monotonic()
                     })
+                    mqtt_client.publish("cozmo/audio_input/wake_word", json_as_string)
+
+                # If we're listening, buffer audio and check for silence
+                if listening:
+                    whisper_audio += frame
+
+                    if listening_start_time is None:
+                        listening_start_time = time.monotonic()
+
+                    energy = np.abs(pcm).mean()
+                    if energy < silence_threshold:
+                        if silence_start_time is None:
+                            silence_start_time = time.monotonic()
+                        elif time.monotonic() - silence_start_time > silence_duration:
+                            print("[AudioServer] Silence detected. Ending listening.")
+                            listening = False
+                    else:
+                        silence_start_time = None
+
+                    if time.monotonic() - listening_start_time > max_listen_duration:
+                        print("[AudioServer] Timeout reached. Ending listening.")
+                        listening = False
+
+                # Handle stop condition
+                if not listening and whisper_audio:
+                    with NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
+                        sf.write(tmpfile.name, np.frombuffer(whisper_audio, dtype=np.int16), 16000, 'PCM_16')
+                        result = whisper_model.transcribe(tmpfile.name)
+                        mqtt_client.publish("cozmo/audio_input/transcription", {
+                            "event": "speech_transcribed",
+                            "text": result['text'],
+                            "stamp": time.monotonic()
+                        })
+                        whisper_audio.clear()
+                    # Reset timers
+                    listening_start_time = None
+                    silence_start_time = None
 
     except websockets.exceptions.ConnectionClosed:
         print("[AudioServer] Client disconnected unexpectedly.")
+
 
 async def start_server():
     print(f"[AudioServer] Starting WebSocket server on ws://{HOST}:{PORT}{PATH}")
